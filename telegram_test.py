@@ -1,3 +1,7 @@
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 import requests
 import yfinance as yf
 import pandas as pd
