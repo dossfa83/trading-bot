@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 import yfinance as yf
 import pandas as pd
@@ -7,9 +6,6 @@ import pandas as pd
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-STATE_FILE = "trade_state.json"
-
-# أضفنا البيتكوين هنا
 SYMBOLS = ["BTC-USD", "AAPL", "TSLA", "NVDA"]
 
 def send_telegram(message: str) -> None:
@@ -30,17 +26,6 @@ def send_telegram(message: str) -> None:
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
 def analyze_symbol(symbol: str):
     try:
         print(f"Fetching {symbol}...")
@@ -53,8 +38,8 @@ def analyze_symbol(symbol: str):
             progress=False
         )
 
-        if data.empty or len(data) < 15:
-            print(f"No enough data for {symbol}")
+        if data.empty or len(data) < 12:
+            print(f"Not enough data for {symbol}")
             return None
 
         close_col = data["Close"]
@@ -63,18 +48,39 @@ def analyze_symbol(symbol: str):
         else:
             close = close_col
 
+        sma10 = close.rolling(10).mean()
+
+        prev_close = float(close.iloc[-2])
         last_close = float(close.iloc[-1])
-        sma10 = float(close.rolling(10).mean().iloc[-1])
 
-        position = 1 if last_close > sma10 else 0
+        prev_sma = float(sma10.iloc[-2])
+        last_sma = float(sma10.iloc[-1])
 
-        return {
-            "symbol": symbol,
-            "position": position,
-            "last_close": round(last_close, 2),
-            "stop_loss": round(last_close * 0.98, 2),
-            "take_profit": round(last_close * 1.02, 2)
-        }
+        if pd.isna(prev_sma) or pd.isna(last_sma):
+            print(f"SMA not ready for {symbol}")
+            return None
+
+        buy_cross = prev_close <= prev_sma and last_close > last_sma
+        sell_cross = prev_close >= prev_sma and last_close < last_sma
+
+        if buy_cross:
+            return {
+                "symbol": symbol,
+                "signal": "BUY",
+                "price": round(last_close, 2),
+                "tp": round(last_close * 1.02, 2),
+                "sl": round(last_close * 0.98, 2)
+            }
+
+        if sell_cross:
+            return {
+                "symbol": symbol,
+                "signal": "SELL",
+                "price": round(last_close, 2)
+            }
+
+        print(f"No fresh signal for {symbol}")
+        return None
 
     except Exception as e:
         print(f"Error analyzing {symbol}: {e}")
@@ -83,40 +89,31 @@ def analyze_symbol(symbol: str):
 def run_once() -> None:
     print("Bot started...")
 
-    state = load_state()
-
     for symbol in SYMBOLS:
         result = analyze_symbol(symbol)
         if result is None:
             continue
 
-        old = state.get(symbol, {"position": 0})
-        old_pos = int(old.get("position", 0))
-        new_pos = int(result["position"])
-
-        if old_pos == 0 and new_pos == 1:
+        if result["signal"] == "BUY":
             msg = (
                 f"🔥 BUY SIGNAL\n\n"
-                f"Symbol: {symbol}\n"
-                f"Entry: {result['last_close']}\n"
-                f"TP: {result['take_profit']}\n"
-                f"SL: {result['stop_loss']}"
+                f"Symbol: {result['symbol']}\n"
+                f"Entry: {result['price']}\n"
+                f"TP: {result['tp']}\n"
+                f"SL: {result['sl']}"
             )
             send_telegram(msg)
             print(f"BUY sent for {symbol}")
 
-        elif old_pos == 1 and new_pos == 0:
+        elif result["signal"] == "SELL":
             msg = (
                 f"❌ SELL SIGNAL\n\n"
-                f"Symbol: {symbol}\n"
-                f"Exit: {result['last_close']}"
+                f"Symbol: {result['symbol']}\n"
+                f"Exit: {result['price']}"
             )
             send_telegram(msg)
             print(f"SELL sent for {symbol}")
 
-        state[symbol] = result
-
-    save_state(state)
     print("Finished")
 
 if __name__ == "__main__":
