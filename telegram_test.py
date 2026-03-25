@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import yfinance as yf
 import pandas as pd
@@ -7,6 +8,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOLS = ["BTC-USD", "AAPL", "TSLA", "NVDA"]
+STATE_FILE = "signal_state.json"
 
 def send_telegram(message: str) -> None:
     if not TOKEN or not CHAT_ID:
@@ -26,18 +28,27 @@ def send_telegram(message: str) -> None:
     except Exception as e:
         print(f"Telegram error: {e}")
 
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
 def normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
     if isinstance(data.columns, pd.MultiIndex):
-        df = pd.DataFrame({
+        return pd.DataFrame({
             "Open": data["Open"].iloc[:, 0],
             "High": data["High"].iloc[:, 0],
             "Low": data["Low"].iloc[:, 0],
             "Close": data["Close"].iloc[:, 0],
             "Volume": data["Volume"].iloc[:, 0],
-        })
-    else:
-        df = data[["Open", "High", "Low", "Close", "Volume"]].copy()
-    return df.dropna().copy()
+        }).dropna()
+    return data[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["Close"]
@@ -80,7 +91,60 @@ def fetch_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
         print(f"Fetch error {symbol} {interval}: {e}")
         return None
 
-def analyze_symbol(symbol: str):
+def get_market_filter() -> bool:
+    """
+    يرجع True إذا السوق العام مناسب للشراء.
+    نستخدم SPY للأسهم فقط. البيتكوين ما يحتاج هذا الفلتر.
+    """
+    try:
+        spy = fetch_data("SPY", interval="15m", period="5d")
+        if spy is None or len(spy) < 60:
+            print("SPY filter unavailable, defaulting to True")
+            return True
+
+        spy = add_indicators(spy).dropna()
+        if len(spy) < 2:
+            return True
+
+        last = spy.iloc[-1]
+        market_ok = (
+            last["EMA9"] > last["EMA21"] > last["EMA50"] and
+            last["MACD"] > last["MACD_SIGNAL"] and
+            last["RSI"] > 50
+        )
+
+        print("Market filter SPY:", market_ok)
+        return bool(market_ok)
+    except Exception as e:
+        print("Market filter error:", e)
+        return True
+
+def confidence_score(last5, last15):
+    score = 0
+
+    if last5["EMA9"] > last5["EMA21"]:
+        score += 1
+    if last15["EMA9"] > last15["EMA21"]:
+        score += 1
+    if last15["EMA21"] > last15["EMA50"]:
+        score += 1
+    if last5["MACD"] > last5["MACD_SIGNAL"]:
+        score += 1
+    if last15["MACD"] > last15["MACD_SIGNAL"]:
+        score += 1
+    if last5["Volume"] > last5["VOL_AVG20"]:
+        score += 1
+    if 52 <= last5["RSI"] <= 68:
+        score += 1
+
+    if score >= 6:
+        return "High", score
+    elif score >= 4:
+        return "Medium", score
+    else:
+        return "Low", score
+
+def analyze_symbol(symbol: str, market_ok: bool):
     try:
         print(f"Analyzing {symbol}...")
 
@@ -102,7 +166,9 @@ def analyze_symbol(symbol: str):
         last5 = df5.iloc[-1]
         last15 = df15.iloc[-1]
 
-        # فلتر الاتجاه العام على 15m
+        # فلتر السوق يطبق على الأسهم فقط، مو البيتكوين
+        use_market_filter = symbol != "BTC-USD"
+
         trend_up_15m = (
             last15["EMA9"] > last15["EMA21"] > last15["EMA50"] and
             last15["RSI"] > 52 and
@@ -114,7 +180,6 @@ def analyze_symbol(symbol: str):
             last15["MACD"] < last15["MACD_SIGNAL"]
         )
 
-        # إشارة 5m
         buy_cross_5m = prev5["EMA9"] <= prev5["EMA21"] and last5["EMA9"] > last5["EMA21"]
         sell_cross_5m = prev5["EMA9"] >= prev5["EMA21"] and last5["EMA9"] < last5["EMA21"]
 
@@ -123,7 +188,8 @@ def analyze_symbol(symbol: str):
             buy_cross_5m and
             52 <= last5["RSI"] <= 68 and
             last5["MACD"] > last5["MACD_SIGNAL"] and
-            last5["Volume"] > last5["VOL_AVG20"]
+            last5["Volume"] > last5["VOL_AVG20"] and
+            (market_ok if use_market_filter else True)
         )
 
         sell_signal = (
@@ -132,6 +198,7 @@ def analyze_symbol(symbol: str):
         )
 
         last_close = round(float(last5["Close"]), 2)
+        confidence, score = confidence_score(last5, last15)
 
         if buy_signal:
             return {
@@ -141,7 +208,9 @@ def analyze_symbol(symbol: str):
                 "tp": round(last_close * 1.03, 2),
                 "sl": round(last_close * 0.985, 2),
                 "rsi_5m": round(float(last5["RSI"]), 2),
-                "rsi_15m": round(float(last15["RSI"]), 2)
+                "rsi_15m": round(float(last15["RSI"]), 2),
+                "confidence": confidence,
+                "score": score
             }
 
         if sell_signal:
@@ -150,7 +219,9 @@ def analyze_symbol(symbol: str):
                 "signal": "SELL",
                 "price": last_close,
                 "rsi_5m": round(float(last5["RSI"]), 2),
-                "rsi_15m": round(float(last15["RSI"]), 2)
+                "rsi_15m": round(float(last15["RSI"]), 2),
+                "confidence": confidence,
+                "score": score
             }
 
         print(f"No fresh signal for {symbol}")
@@ -162,42 +233,52 @@ def analyze_symbol(symbol: str):
 
 def run_once() -> None:
     print("Bot started...")
-    found_signal = False
+    market_ok = get_market_filter()
+    state = load_state()
 
     for symbol in SYMBOLS:
-        result = analyze_symbol(symbol)
+        result = analyze_symbol(symbol, market_ok)
+        current_signal = result["signal"] if result else "NONE"
+        previous_signal = state.get(symbol, "NONE")
+
+        # لا ترسل إذا نفس الإشارة السابقة
+        if current_signal == previous_signal:
+            print(f"Skipping duplicate signal for {symbol}: {current_signal}")
+            continue
+
+        # حدث الحالة دائمًا
+        state[symbol] = current_signal
+
         if result is None:
             continue
 
-        found_signal = True
-
         if result["signal"] == "BUY":
             msg = (
-                f"🔥 BUY SIGNAL PRO+\n\n"
+                f"🔥 BUY SIGNAL PRO+ 2\n\n"
                 f"Symbol: {result['symbol']}\n"
                 f"Entry: {result['price']}\n"
                 f"TP: {result['tp']}\n"
                 f"SL: {result['sl']}\n"
                 f"RSI 5m: {result['rsi_5m']}\n"
-                f"RSI 15m: {result['rsi_15m']}"
+                f"RSI 15m: {result['rsi_15m']}\n"
+                f"Confidence: {result['confidence']} ({result['score']}/7)"
             )
             send_telegram(msg)
             print(f"BUY sent for {symbol}")
 
         elif result["signal"] == "SELL":
             msg = (
-                f"❌ SELL SIGNAL PRO+\n\n"
+                f"❌ SELL SIGNAL PRO+ 2\n\n"
                 f"Symbol: {result['symbol']}\n"
                 f"Exit: {result['price']}\n"
                 f"RSI 5m: {result['rsi_5m']}\n"
-                f"RSI 15m: {result['rsi_15m']}"
+                f"RSI 15m: {result['rsi_15m']}\n"
+                f"Confidence: {result['confidence']} ({result['score']}/7)"
             )
             send_telegram(msg)
             print(f"SELL sent for {symbol}")
 
-    if not found_signal:
-        print("No signals this run.")
-
+    save_state(state)
     print("Finished")
 
 if __name__ == "__main__":
