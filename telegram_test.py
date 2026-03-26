@@ -46,11 +46,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = df["Low"]
     volume = df["Volume"]
 
-    # Trend EMAs
     df["EMA20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -59,22 +57,18 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
-    # VWAP
     typical_price = (high + low + close) / 3
     cumulative_tpv = (typical_price * volume).cumsum()
     cumulative_volume = volume.cumsum()
     df["VWAP"] = cumulative_tpv / cumulative_volume
 
-    # Volume
     df["VOL_AVG20"] = volume.rolling(20).mean()
 
-    # ATR
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()
@@ -82,7 +76,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # Breakout helpers
     df["PREV_HIGH_20"] = high.shift(1).rolling(20).max()
     df["PREV_LOW_20"] = low.shift(1).rolling(20).min()
 
@@ -131,11 +124,9 @@ def analyze_btc():
             print("Not enough indicator data")
             return None
 
-        prev5 = df5.iloc[-2]
         last5 = df5.iloc[-1]
         last15 = df15.iloc[-1]
 
-        # Higher timeframe bias
         bullish_bias = (
             last15["Close"] > last15["EMA20"] > last15["EMA50"] and
             last15["RSI"] > 55 and
@@ -150,7 +141,6 @@ def analyze_btc():
             last15["Close"] < last15["VWAP"]
         )
 
-        # Lower timeframe trigger
         breakout_long = last5["Close"] > last5["PREV_HIGH_20"]
         breakdown_short = last5["Close"] < last5["PREV_LOW_20"]
 
@@ -191,12 +181,10 @@ def analyze_btc():
         price = round(float(last5["Close"]), 2)
         atr = float(last5["ATR"])
 
-        # Entry zone
         entry_low = round(price - (0.15 * atr), 2)
         entry_high = round(price + (0.15 * atr), 2)
         ideal_entry = price
 
-        # Risk management
         stop_loss_long = round(price - (1.2 * atr), 2)
         tp1_long = round(price + (1.2 * atr), 2)
         tp2_long = round(price + (2.0 * atr), 2)
@@ -207,7 +195,6 @@ def analyze_btc():
         tp2_short = round(price - (2.0 * atr), 2)
         tp3_short = round(price - (3.0 * atr), 2)
 
-        # Score
         long_score = 0
         long_score += int(bullish_bias)
         long_score += int(breakout_long)
@@ -335,7 +322,9 @@ def run_once() -> None:
     result = analyze_btc()
 
     if result is None:
-        print("Finished - no signal")
+        msg = "📊 BTC CHECK\n\nNo elite setup right now."
+        send_telegram(msg)
+        print("No signal sent to Telegram")
         return
 
     msg = format_trade_message(result)
