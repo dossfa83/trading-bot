@@ -1,14 +1,13 @@
 import os
-import json
 import requests
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-SYMBOLS = ["BTC-USD", "AAPL", "TSLA", "NVDA"]
-STATE_FILE = "signal_state.json"
+SYMBOL = "BTC-USD"
 
 def send_telegram(message: str) -> None:
     if not TOKEN or not CHAT_ID:
@@ -28,36 +27,31 @@ def send_telegram(message: str) -> None:
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
 def normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
     if isinstance(data.columns, pd.MultiIndex):
-        return pd.DataFrame({
+        df = pd.DataFrame({
             "Open": data["Open"].iloc[:, 0],
             "High": data["High"].iloc[:, 0],
             "Low": data["Low"].iloc[:, 0],
             "Close": data["Close"].iloc[:, 0],
             "Volume": data["Volume"].iloc[:, 0],
-        }).dropna()
-    return data[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+        })
+    else:
+        df = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+    return df.dropna().copy()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
     volume = df["Volume"]
 
-    df["EMA9"] = close.ewm(span=9, adjust=False).mean()
-    df["EMA21"] = close.ewm(span=21, adjust=False).mean()
+    # Trend EMAs
+    df["EMA20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
+    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -66,12 +60,32 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
+    # VWAP
+    typical_price = (high + low + close) / 3
+    cumulative_tpv = (typical_price * volume).cumsum()
+    cumulative_volume = volume.cumsum()
+    df["VWAP"] = cumulative_tpv / cumulative_volume
+
+    # Volume
     df["VOL_AVG20"] = volume.rolling(20).mean()
+
+    # ATR (Average True Range)
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    # آخر 20 قمة لتأكيد الاختراق
+    df["ROLLING_HIGH20"] = high.rolling(20).max()
+
     return df
 
 def fetch_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
@@ -85,128 +99,106 @@ def fetch_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
         )
         if raw.empty:
             return None
-        df = normalize_ohlcv(raw)
-        return df if not df.empty else None
+        return normalize_ohlcv(raw)
     except Exception as e:
         print(f"Fetch error {symbol} {interval}: {e}")
         return None
 
-def get_market_filter() -> bool:
-    """
-    يرجع True إذا السوق العام مناسب للشراء.
-    نستخدم SPY للأسهم فقط. البيتكوين ما يحتاج هذا الفلتر.
-    """
-    try:
-        spy = fetch_data("SPY", interval="15m", period="5d")
-        if spy is None or len(spy) < 60:
-            print("SPY filter unavailable, defaulting to True")
-            return True
-
-        spy = add_indicators(spy).dropna()
-        if len(spy) < 2:
-            return True
-
-        last = spy.iloc[-1]
-        market_ok = (
-            last["EMA9"] > last["EMA21"] > last["EMA50"] and
-            last["MACD"] > last["MACD_SIGNAL"] and
-            last["RSI"] > 50
-        )
-
-        print("Market filter SPY:", market_ok)
-        return bool(market_ok)
-    except Exception as e:
-        print("Market filter error:", e)
-        return True
-
-def confidence_score(last5, last15):
-    score = 0
-
-    if last5["EMA9"] > last5["EMA21"]:
-        score += 1
-    if last15["EMA9"] > last15["EMA21"]:
-        score += 1
-    if last15["EMA21"] > last15["EMA50"]:
-        score += 1
-    if last5["MACD"] > last5["MACD_SIGNAL"]:
-        score += 1
-    if last15["MACD"] > last15["MACD_SIGNAL"]:
-        score += 1
-    if last5["Volume"] > last5["VOL_AVG20"]:
-        score += 1
-    if 52 <= last5["RSI"] <= 68:
-        score += 1
-
+def confidence_label(score: int) -> str:
     if score >= 6:
-        return "High", score
-    elif score >= 4:
-        return "Medium", score
-    else:
-        return "Low", score
+        return "High"
+    if score >= 4:
+        return "Medium"
+    return "Low"
 
-def analyze_symbol(symbol: str, market_ok: bool):
+def analyze_btc():
     try:
-        print(f"Analyzing {symbol}...")
+        print("Analyzing BTC-USD...")
 
-        df5 = fetch_data(symbol, interval="5m", period="5d")
-        df15 = fetch_data(symbol, interval="15m", period="5d")
+        df5 = fetch_data(SYMBOL, interval="5m", period="5d")
+        df15 = fetch_data(SYMBOL, interval="15m", period="5d")
 
         if df5 is None or df15 is None:
-            print(f"No data for {symbol}")
+            print("No data")
             return None
 
         df5 = add_indicators(df5).dropna().copy()
         df15 = add_indicators(df15).dropna().copy()
 
-        if len(df5) < 5 or len(df15) < 5:
-            print(f"Not enough indicator data for {symbol}")
+        if len(df5) < 30 or len(df15) < 30:
+            print("Not enough indicator data")
             return None
 
         prev5 = df5.iloc[-2]
         last5 = df5.iloc[-1]
         last15 = df15.iloc[-1]
 
-        # فلتر السوق يطبق على الأسهم فقط، مو البيتكوين
-        use_market_filter = symbol != "BTC-USD"
-
+        # اتجاه عام محترف على 15m
         trend_up_15m = (
-            last15["EMA9"] > last15["EMA21"] > last15["EMA50"] and
-            last15["RSI"] > 52 and
+            last15["Close"] > last15["EMA20"] > last15["EMA50"] and
+            last15["RSI"] > 55 and
             last15["MACD"] > last15["MACD_SIGNAL"]
         )
 
         trend_down_15m = (
-            last15["EMA9"] < last15["EMA21"] and
+            last15["Close"] < last15["EMA20"] and
+            last15["EMA20"] < last15["EMA50"] and
             last15["MACD"] < last15["MACD_SIGNAL"]
         )
 
-        buy_cross_5m = prev5["EMA9"] <= prev5["EMA21"] and last5["EMA9"] > last5["EMA21"]
-        sell_cross_5m = prev5["EMA9"] >= prev5["EMA21"] and last5["EMA9"] < last5["EMA21"]
+        # دخول احترافي على 5m:
+        # اختراق + فوق VWAP + زخم + فوليوم
+        breakout = last5["Close"] > prev5["ROLLING_HIGH20"]
+        ema_confirm = last5["EMA20"] > last5["EMA50"]
+        rsi_confirm = 55 <= last5["RSI"] <= 72
+        macd_confirm = last5["MACD"] > last5["MACD_SIGNAL"]
+        vwap_confirm = last5["Close"] > last5["VWAP"]
+        volume_confirm = last5["Volume"] > 1.2 * last5["VOL_AVG20"]
 
         buy_signal = (
             trend_up_15m and
-            buy_cross_5m and
-            52 <= last5["RSI"] <= 68 and
-            last5["MACD"] > last5["MACD_SIGNAL"] and
-            last5["Volume"] > last5["VOL_AVG20"] and
-            (market_ok if use_market_filter else True)
+            breakout and
+            ema_confirm and
+            rsi_confirm and
+            macd_confirm and
+            vwap_confirm and
+            volume_confirm
         )
 
+        # خروج احترافي إذا ضعف الاتجاه
         sell_signal = (
             trend_down_15m and
-            sell_cross_5m
+            last5["MACD"] < last5["MACD_SIGNAL"] and
+            last5["Close"] < last5["EMA20"]
         )
 
-        last_close = round(float(last5["Close"]), 2)
-        confidence, score = confidence_score(last5, last15)
+        price = round(float(last5["Close"]), 2)
+        atr = float(last5["ATR"])
+
+        # وقف وهدف مبنيين على ATR
+        stop_loss = round(price - (1.2 * atr), 2)
+        take_profit_1 = round(price + (1.5 * atr), 2)
+        take_profit_2 = round(price + (2.5 * atr), 2)
+
+        # درجة الثقة
+        score = 0
+        score += int(trend_up_15m)
+        score += int(breakout)
+        score += int(ema_confirm)
+        score += int(rsi_confirm)
+        score += int(macd_confirm)
+        score += int(vwap_confirm)
+        score += int(volume_confirm)
+        confidence = confidence_label(score)
 
         if buy_signal:
             return {
-                "symbol": symbol,
                 "signal": "BUY",
-                "price": last_close,
-                "tp": round(last_close * 1.03, 2),
-                "sl": round(last_close * 0.985, 2),
+                "price": price,
+                "tp1": take_profit_1,
+                "tp2": take_profit_2,
+                "sl": stop_loss,
+                "atr": round(atr, 2),
                 "rsi_5m": round(float(last5["RSI"]), 2),
                 "rsi_15m": round(float(last15["RSI"]), 2),
                 "confidence": confidence,
@@ -215,70 +207,58 @@ def analyze_symbol(symbol: str, market_ok: bool):
 
         if sell_signal:
             return {
-                "symbol": symbol,
                 "signal": "SELL",
-                "price": last_close,
+                "price": price,
                 "rsi_5m": round(float(last5["RSI"]), 2),
                 "rsi_15m": round(float(last15["RSI"]), 2),
                 "confidence": confidence,
                 "score": score
             }
 
-        print(f"No fresh signal for {symbol}")
+        print("No fresh signal.")
         return None
 
     except Exception as e:
-        print(f"Analyze error {symbol}: {e}")
+        print(f"Analyze error: {e}")
         return None
 
 def run_once() -> None:
     print("Bot started...")
-    market_ok = get_market_filter()
-    state = load_state()
 
-    for symbol in SYMBOLS:
-        result = analyze_symbol(symbol, market_ok)
-        current_signal = result["signal"] if result else "NONE"
-        previous_signal = state.get(symbol, "NONE")
+    result = analyze_btc()
 
-        # لا ترسل إذا نفس الإشارة السابقة
-        if current_signal == previous_signal:
-            print(f"Skipping duplicate signal for {symbol}: {current_signal}")
-            continue
+    if result is None:
+        print("Finished - no signal")
+        return
 
-        # حدث الحالة دائمًا
-        state[symbol] = current_signal
+    if result["signal"] == "BUY":
+        msg = (
+            f"🔥 BTC BUY SIGNAL PRO\n\n"
+            f"Symbol: {SYMBOL}\n"
+            f"Buy Price: {result['price']}\n"
+            f"Take Profit 1: {result['tp1']}\n"
+            f"Take Profit 2: {result['tp2']}\n"
+            f"Stop Loss: {result['sl']}\n"
+            f"ATR: {result['atr']}\n"
+            f"RSI 5m: {result['rsi_5m']}\n"
+            f"RSI 15m: {result['rsi_15m']}\n"
+            f"Confidence: {result['confidence']} ({result['score']}/7)"
+        )
+        send_telegram(msg)
+        print("BUY sent")
 
-        if result is None:
-            continue
+    elif result["signal"] == "SELL":
+        msg = (
+            f"❌ BTC SELL / EXIT SIGNAL PRO\n\n"
+            f"Symbol: {SYMBOL}\n"
+            f"Exit Price: {result['price']}\n"
+            f"RSI 5m: {result['rsi_5m']}\n"
+            f"RSI 15m: {result['rsi_15m']}\n"
+            f"Confidence: {result['confidence']} ({result['score']}/7)"
+        )
+        send_telegram(msg)
+        print("SELL sent")
 
-        if result["signal"] == "BUY":
-            msg = (
-                f"🔥 BUY SIGNAL PRO+ 2\n\n"
-                f"Symbol: {result['symbol']}\n"
-                f"Entry: {result['price']}\n"
-                f"TP: {result['tp']}\n"
-                f"SL: {result['sl']}\n"
-                f"RSI 5m: {result['rsi_5m']}\n"
-                f"RSI 15m: {result['rsi_15m']}\n"
-                f"Confidence: {result['confidence']} ({result['score']}/7)"
-            )
-            send_telegram(msg)
-            print(f"BUY sent for {symbol}")
-
-        elif result["signal"] == "SELL":
-            msg = (
-                f"❌ SELL SIGNAL PRO+ 2\n\n"
-                f"Symbol: {result['symbol']}\n"
-                f"Exit: {result['price']}\n"
-                f"RSI 5m: {result['rsi_5m']}\n"
-                f"RSI 15m: {result['rsi_15m']}\n"
-                f"Confidence: {result['confidence']} ({result['score']}/7)"
-            )
-            send_telegram(msg)
-            print(f"SELL sent for {symbol}")
-
-    save_state(state)
     print("Finished")
 
 if __name__ == "__main__":
