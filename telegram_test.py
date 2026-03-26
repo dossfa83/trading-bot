@@ -2,7 +2,6 @@ import os
 import requests
 import yfinance as yf
 import pandas as pd
-import numpy as np
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -75,7 +74,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Volume
     df["VOL_AVG20"] = volume.rolling(20).mean()
 
-    # ATR (Average True Range)
+    # ATR
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()
@@ -83,8 +82,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # آخر 20 قمة لتأكيد الاختراق
-    df["ROLLING_HIGH20"] = high.rolling(20).max()
+    # Breakout helpers
+    df["PREV_HIGH_20"] = high.shift(1).rolling(20).max()
+    df["PREV_LOW_20"] = low.shift(1).rolling(20).min()
 
     return df
 
@@ -104,12 +104,14 @@ def fetch_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
         print(f"Fetch error {symbol} {interval}: {e}")
         return None
 
-def confidence_label(score: int) -> str:
+def score_to_strength(score: int) -> str:
+    if score >= 7:
+        return "ELITE"
     if score >= 6:
-        return "High"
+        return "HIGH"
     if score >= 4:
-        return "Medium"
-    return "Low"
+        return "MEDIUM"
+    return "LOW"
 
 def analyze_btc():
     try:
@@ -133,132 +135,212 @@ def analyze_btc():
         last5 = df5.iloc[-1]
         last15 = df15.iloc[-1]
 
-        # اتجاه عام محترف على 15m
-        trend_up_15m = (
+        # Higher timeframe bias
+        bullish_bias = (
             last15["Close"] > last15["EMA20"] > last15["EMA50"] and
             last15["RSI"] > 55 and
-            last15["MACD"] > last15["MACD_SIGNAL"]
+            last15["MACD"] > last15["MACD_SIGNAL"] and
+            last15["Close"] > last15["VWAP"]
         )
 
-        trend_down_15m = (
-            last15["Close"] < last15["EMA20"] and
-            last15["EMA20"] < last15["EMA50"] and
-            last15["MACD"] < last15["MACD_SIGNAL"]
+        bearish_bias = (
+            last15["Close"] < last15["EMA20"] < last15["EMA50"] and
+            last15["RSI"] < 45 and
+            last15["MACD"] < last15["MACD_SIGNAL"] and
+            last15["Close"] < last15["VWAP"]
         )
 
-        # دخول احترافي على 5m:
-        # اختراق + فوق VWAP + زخم + فوليوم
-        breakout = last5["Close"] > prev5["ROLLING_HIGH20"]
-        ema_confirm = last5["EMA20"] > last5["EMA50"]
-        rsi_confirm = 55 <= last5["RSI"] <= 72
-        macd_confirm = last5["MACD"] > last5["MACD_SIGNAL"]
-        vwap_confirm = last5["Close"] > last5["VWAP"]
-        volume_confirm = last5["Volume"] > 1.2 * last5["VOL_AVG20"]
+        # Lower timeframe trigger
+        breakout_long = last5["Close"] > last5["PREV_HIGH_20"]
+        breakdown_short = last5["Close"] < last5["PREV_LOW_20"]
+
+        ema_confirm_long = last5["EMA20"] > last5["EMA50"]
+        ema_confirm_short = last5["EMA20"] < last5["EMA50"]
+
+        rsi_long = 55 <= last5["RSI"] <= 72
+        rsi_short = 28 <= last5["RSI"] <= 45
+
+        macd_long = last5["MACD"] > last5["MACD_SIGNAL"]
+        macd_short = last5["MACD"] < last5["MACD_SIGNAL"]
+
+        vwap_long = last5["Close"] > last5["VWAP"]
+        vwap_short = last5["Close"] < last5["VWAP"]
+
+        volume_spike = last5["Volume"] > 1.25 * last5["VOL_AVG20"]
 
         buy_signal = (
-            trend_up_15m and
-            breakout and
-            ema_confirm and
-            rsi_confirm and
-            macd_confirm and
-            vwap_confirm and
-            volume_confirm
+            bullish_bias and
+            breakout_long and
+            ema_confirm_long and
+            rsi_long and
+            macd_long and
+            vwap_long and
+            volume_spike
         )
 
-        # خروج احترافي إذا ضعف الاتجاه
         sell_signal = (
-            trend_down_15m and
-            last5["MACD"] < last5["MACD_SIGNAL"] and
-            last5["Close"] < last5["EMA20"]
+            bearish_bias and
+            breakdown_short and
+            ema_confirm_short and
+            rsi_short and
+            macd_short and
+            vwap_short and
+            volume_spike
         )
 
         price = round(float(last5["Close"]), 2)
         atr = float(last5["ATR"])
 
-        # وقف وهدف مبنيين على ATR
-        stop_loss = round(price - (1.2 * atr), 2)
-        take_profit_1 = round(price + (1.5 * atr), 2)
-        take_profit_2 = round(price + (2.5 * atr), 2)
+        # Entry zone
+        entry_low = round(price - (0.15 * atr), 2)
+        entry_high = round(price + (0.15 * atr), 2)
+        ideal_entry = price
 
-        # درجة الثقة
-        score = 0
-        score += int(trend_up_15m)
-        score += int(breakout)
-        score += int(ema_confirm)
-        score += int(rsi_confirm)
-        score += int(macd_confirm)
-        score += int(vwap_confirm)
-        score += int(volume_confirm)
-        confidence = confidence_label(score)
+        # Risk management
+        stop_loss_long = round(price - (1.2 * atr), 2)
+        tp1_long = round(price + (1.2 * atr), 2)
+        tp2_long = round(price + (2.0 * atr), 2)
+        tp3_long = round(price + (3.0 * atr), 2)
+
+        stop_loss_short = round(price + (1.2 * atr), 2)
+        tp1_short = round(price - (1.2 * atr), 2)
+        tp2_short = round(price - (2.0 * atr), 2)
+        tp3_short = round(price - (3.0 * atr), 2)
+
+        # Score
+        long_score = 0
+        long_score += int(bullish_bias)
+        long_score += int(breakout_long)
+        long_score += int(ema_confirm_long)
+        long_score += int(rsi_long)
+        long_score += int(macd_long)
+        long_score += int(vwap_long)
+        long_score += int(volume_spike)
+
+        short_score = 0
+        short_score += int(bearish_bias)
+        short_score += int(breakdown_short)
+        short_score += int(ema_confirm_short)
+        short_score += int(rsi_short)
+        short_score += int(macd_short)
+        short_score += int(vwap_short)
+        short_score += int(volume_spike)
 
         if buy_signal:
             return {
                 "signal": "BUY",
+                "setup_type": "Momentum Breakout Long",
                 "price": price,
-                "tp1": take_profit_1,
-                "tp2": take_profit_2,
-                "sl": stop_loss,
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "ideal_entry": ideal_entry,
+                "sl": stop_loss_long,
+                "tp1": tp1_long,
+                "tp2": tp2_long,
+                "tp3": tp3_long,
                 "atr": round(atr, 2),
                 "rsi_5m": round(float(last5["RSI"]), 2),
                 "rsi_15m": round(float(last15["RSI"]), 2),
-                "confidence": confidence,
-                "score": score
+                "strength": score_to_strength(long_score),
+                "score": long_score,
+                "reasons": [
+                    "15m bullish trend confirmed",
+                    "5m breakout above recent high",
+                    "Price above VWAP",
+                    "MACD bullish confirmation",
+                    "Volume expansion detected"
+                ]
             }
 
         if sell_signal:
             return {
                 "signal": "SELL",
+                "setup_type": "Momentum Breakdown Short",
                 "price": price,
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "ideal_entry": ideal_entry,
+                "sl": stop_loss_short,
+                "tp1": tp1_short,
+                "tp2": tp2_short,
+                "tp3": tp3_short,
+                "atr": round(atr, 2),
                 "rsi_5m": round(float(last5["RSI"]), 2),
                 "rsi_15m": round(float(last15["RSI"]), 2),
-                "confidence": confidence,
-                "score": score
+                "strength": score_to_strength(short_score),
+                "score": short_score,
+                "reasons": [
+                    "15m bearish trend confirmed",
+                    "5m breakdown below recent low",
+                    "Price below VWAP",
+                    "MACD bearish confirmation",
+                    "Volume expansion detected"
+                ]
             }
 
-        print("No fresh signal.")
+        print("No elite setup.")
         return None
 
     except Exception as e:
         print(f"Analyze error: {e}")
         return None
 
+def format_trade_message(result: dict) -> str:
+    reasons_text = "\n".join([f"- {r}" for r in result["reasons"]])
+
+    if result["signal"] == "BUY":
+        direction = "LONG"
+        plan = (
+            "Trade Plan:\n"
+            "- Enter only if price holds above entry zone.\n"
+            "- Secure part of profits at TP1.\n"
+            "- Move stop toward breakeven after TP1.\n"
+            "- Let runner target TP2 / TP3 if momentum stays strong."
+        )
+        emoji = "🔥"
+        title = "BTC ELITE SCALP SETUP"
+
+    else:
+        direction = "SHORT"
+        plan = (
+            "Trade Plan:\n"
+            "- Enter only if price stays below entry zone.\n"
+            "- Secure part of profits at TP1.\n"
+            "- Tighten risk after TP1.\n"
+            "- Let runner target TP2 / TP3 if downside momentum continues."
+        )
+        emoji = "❌"
+        title = "BTC ELITE SHORT SETUP"
+
+    return (
+        f"{emoji} {title}\n\n"
+        f"Direction: {direction}\n"
+        f"Setup Type: {result['setup_type']}\n"
+        f"Entry Zone: {result['entry_low']} - {result['entry_high']}\n"
+        f"Ideal Entry: {result['ideal_entry']}\n"
+        f"Stop Loss: {result['sl']}\n"
+        f"Target 1: {result['tp1']}\n"
+        f"Target 2: {result['tp2']}\n"
+        f"Target 3: {result['tp3']}\n\n"
+        f"Signal Strength: {result['strength']} ({result['score']}/7)\n"
+        f"ATR: {result['atr']}\n"
+        f"RSI 5m: {result['rsi_5m']}\n"
+        f"RSI 15m: {result['rsi_15m']}\n\n"
+        f"Confirmation:\n{reasons_text}\n\n"
+        f"{plan}"
+    )
+
 def run_once() -> None:
     print("Bot started...")
-
     result = analyze_btc()
 
     if result is None:
         print("Finished - no signal")
         return
 
-    if result["signal"] == "BUY":
-        msg = (
-            f"🔥 BTC BUY SIGNAL PRO\n\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Buy Price: {result['price']}\n"
-            f"Take Profit 1: {result['tp1']}\n"
-            f"Take Profit 2: {result['tp2']}\n"
-            f"Stop Loss: {result['sl']}\n"
-            f"ATR: {result['atr']}\n"
-            f"RSI 5m: {result['rsi_5m']}\n"
-            f"RSI 15m: {result['rsi_15m']}\n"
-            f"Confidence: {result['confidence']} ({result['score']}/7)"
-        )
-        send_telegram(msg)
-        print("BUY sent")
-
-    elif result["signal"] == "SELL":
-        msg = (
-            f"❌ BTC SELL / EXIT SIGNAL PRO\n\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Exit Price: {result['price']}\n"
-            f"RSI 5m: {result['rsi_5m']}\n"
-            f"RSI 15m: {result['rsi_15m']}\n"
-            f"Confidence: {result['confidence']} ({result['score']}/7)"
-        )
-        send_telegram(msg)
-        print("SELL sent")
-
+    msg = format_trade_message(result)
+    send_telegram(msg)
+    print(f"{result['signal']} sent")
     print("Finished")
 
 if __name__ == "__main__":
